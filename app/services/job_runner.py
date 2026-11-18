@@ -32,6 +32,7 @@ from app.schemas.api import LayoutRequest
 from app.schemas.config import TemplateConfig
 from app.services import image_tools
 from app.services.card_renderer import CardRenderer
+from app.services.photo_library import PhotoResolver
 from app.services.font_manager import FontLibrary
 from app.services.pdf_layout import compute_layout, render_pdf
 from app.services.tokens import FilenameDeduper, binding_fields, render_template, sanitize_filename, value_to_str
@@ -169,7 +170,7 @@ def run_card_job(job_id: int, retry: bool = False) -> None:
 
         fonts = FontLibrary.from_db(db)
         base = image_tools.open_image(Path(params["image_path"]))
-        renderer = CardRenderer(base, config, fonts)
+        renderer = CardRenderer(base, config, fonts, PhotoResolver())
         used = _used_fields(config)
         filename_field = params.get("filename_field") or config.output.filename_field
         policy = params.get("empty_policy", "render")
@@ -202,8 +203,8 @@ def run_card_job(job_id: int, retry: bool = False) -> None:
                 manifest[str(row)] = name
                 overflow = [r.id for r in card.reports if r.overflow]
                 missing = sorted({g for r in card.reports for g in r.missing_glyphs})
-                if overflow or missing:
-                    msg = []
+                if overflow or missing or card.warnings:
+                    msg = list(card.warnings)
                     if overflow:
                         msg.append(f"text overflows in {', '.join(overflow)}")
                     if missing:

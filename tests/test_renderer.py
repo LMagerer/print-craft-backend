@@ -73,3 +73,57 @@ def test_variant_resolution(font_library):
     assert regular.family == "Noto Sans" and regular.style == "regular"
     roboto = next(f for f in font_library.faces.values() if f.family == "Roboto" and f.style == "regular")
     assert font_library.resolve(roboto.id, bold=True, italic=True).style == "bolditalic"
+
+
+def _layer_config(**kw):
+    from app.schemas.config import Layer, ShapeStyle
+
+    return TemplateConfig(
+        size=SizeConfig(width_mm=100, height_mm=50, dpi=254),  # 10 px per mm
+        background="#ffffff",
+        placeholders=[Placeholder(id="t", binding=Binding(mode="template", template="X"), x_mm=0, y_mm=0, box=Box(width_mm=20, height_mm=10),
+                                  font=FontConfig(size_pt=20, color="#000000"))],
+        layers=[
+            Layer(id="r", kind="shape", x_mm=10, y_mm=10, width_mm=20, height_mm=10, shape=ShapeStyle(type="rect", fill="#ff0000")),
+            Layer(id="t", kind="text"),
+            # Covers the text: the stack order must put it on top.
+            Layer(id="e", kind="shape", x_mm=0, y_mm=0, width_mm=20, height_mm=10, shape=ShapeStyle(type="rect", fill="#00ff00"), opacity=0.5),
+        ],
+        **kw,
+    )
+
+
+def test_layers_background_order_and_opacity(font_library):
+    base = Image.new("RGBA", (1000, 500), (0, 0, 0, 0))
+    card = CardRenderer(base, _layer_config(), font_library).render({})
+    img = card.image
+    assert img.mode == "RGB"  # opaque background drops alpha
+    assert img.getpixel((500, 400)) == (255, 255, 255)
+    assert img.getpixel((200, 150)) == (255, 0, 0)
+    # Half-transparent green over white (and over the text, which is below it).
+    r, g, b = img.getpixel((195, 95))
+    assert g > 200 and r < 140 and abs(r - b) < 3
+
+
+def test_rotated_image_layer_and_photo_lookup(font_library, tmp_path):
+    from app.schemas.config import ImageSource, Layer
+    from app.services import image_tools
+    from app.services.photo_library import PhotoResolver
+
+    buf = io.BytesIO()
+    Image.new("RGB", (40, 20), (0, 0, 255)).save(buf, format="PNG")
+    blue = image_tools.store_image(buf.getvalue()).ref
+    cfg = TemplateConfig(
+        size=SizeConfig(width_mm=100, height_mm=50, dpi=254),
+        layers=[Layer(id="p", kind="image", x_mm=40, y_mm=20, width_mm=20, height_mm=10, rotation=90,
+                      image=ImageSource(mode="field", field="photo", fit="fill"))],
+    )
+    base = Image.new("RGB", (1000, 500), (255, 255, 255))
+    r = CardRenderer(base, cfg, font_library, PhotoResolver({"Ada.PNG": blue}))
+    card = r.render({"photo": "ada"})
+    assert not card.warnings
+    # Rotated 90°: the 200x100 px box becomes 100 wide x 200 tall around its centre (500, 250).
+    assert card.image.getpixel((500, 170)) == (0, 0, 255)
+    assert card.image.getpixel((420, 250)) == (255, 255, 255)
+    missing = r.render({"photo": "nobody.jpg"})
+    assert missing.warnings and "nobody.jpg" in missing.warnings[0]

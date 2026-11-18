@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.schemas.config import TemplateConfig
+from app.schemas.config import TemplateConfig, _check_color
 
 # ----------------------------------------------------------------------------------------------- fonts
 
@@ -128,6 +128,25 @@ class TemplateCreate(BaseModel):
     description: str = ""
     image_ref: str
     config: TemplateConfig | None = None
+
+
+class BlankTemplateCreate(BaseModel):
+    """A new design. Without ``image_ref`` an empty canvas of the given size; with it, the canvas takes the image's
+    size and the image is added as a layer."""
+
+    name: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    width_mm: float = Field(85.6, gt=0, le=2000)
+    height_mm: float = Field(54.0, gt=0, le=2000)
+    dpi: float = Field(300, ge=50, le=1200)
+    background: str | None = "#ffffff"
+    image_ref: str | None = None
+    image_name: str | None = None
+
+    @field_validator("background")
+    @classmethod
+    def _bg(cls, v: str | None) -> str | None:
+        return None if v is None or v == "" else _check_color(v)
 
 
 class TemplateUpdate(BaseModel):

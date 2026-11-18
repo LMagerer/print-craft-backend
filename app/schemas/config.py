@@ -101,10 +101,79 @@ class OutputConfig(_Model):
     format: Literal["png"] = "png"
 
 
+class ImageSource(_Model):
+    """``static``: always ``ref``. ``field``: per record, the column value names an uploaded photo (``ref`` is the
+    editor sample / fallback)."""
+
+    mode: Literal["static", "field"] = "static"
+    ref: str | None = None
+    field: str | None = None
+    # fill: stretch to the box; contain: fit inside (letterbox); cover: fill the box and crop the overflow.
+    fit: Literal["fill", "contain", "cover"] = "cover"
+
+
+class ShapeStyle(_Model):
+    # A line runs along the horizontal centre of its box (rotate the layer for other angles).
+    type: Literal["rect", "ellipse", "line"] = "rect"
+    fill: str | None = "#3b82f6"
+    stroke: str | None = None
+    stroke_width_mm: float = Field(0, ge=0, le=100)
+
+    @field_validator("fill", "stroke")
+    @classmethod
+    def _colors(cls, v: str | None) -> str | None:
+        return None if v is None or v == "" else _check_color(v)
+
+
+class Layer(_Model):
+    """One entry in the design stack (``TemplateConfig.layers``, bottom to top).
+
+    ``text`` layers only reference a placeholder by id (``id == placeholder id``): its geometry, visibility and lock
+    state live on the placeholder. Image and shape layers carry their own geometry; ``rotation`` is clockwise
+    degrees around the box centre.
+    """
+
+    id: str = Field(min_length=1, max_length=100)
+    kind: Literal["text", "image", "shape"]
+    name: str = ""
+    group_id: str | None = None
+    x_mm: float = 0
+    y_mm: float = 0
+    width_mm: float = Field(10, gt=0)
+    height_mm: float = Field(10, gt=0)
+    rotation: float = Field(0, ge=-360, le=360)
+    opacity: float = Field(1, ge=0, le=1)
+    corner_radius_mm: float = Field(0, ge=0)
+    locked: bool = False
+    hidden: bool = False
+    image: ImageSource | None = None
+    shape: ShapeStyle | None = None
+
+    @model_validator(mode="after")
+    def _kind_payload(self) -> Layer:
+        if self.kind == "image" and self.image is None:
+            self.image = ImageSource()
+        if self.kind == "shape" and self.shape is None:
+            self.shape = ShapeStyle()
+        return self
+
+
+class Group(_Model):
+    id: str = Field(min_length=1, max_length=100)
+    name: str = "Group"
+
+
 class TemplateConfig(_Model):
     size: SizeConfig = Field(default_factory=SizeConfig)
+    # Painted under everything (``None`` keeps the base image / transparency as is).
+    background: str | None = None
     placeholders: list[Placeholder] = Field(default_factory=list)
+    # Design stack, bottom to top. Placeholders without a text layer are drawn on top, in list order.
+    layers: list[Layer] = Field(default_factory=list)
+    groups: list[Group] = Field(default_factory=list)
     output: OutputConfig = Field(default_factory=OutputConfig)
+
+    _background = field_validator("background")(lambda cls, v: None if v is None or v == "" else _check_color(v))
 
     @model_validator(mode="after")
     def _unique_ids(self) -> TemplateConfig:
@@ -112,4 +181,34 @@ class TemplateConfig(_Model):
         dupes = {i for i in ids if ids.count(i) > 1}
         if dupes:
             raise ValueError(f"Duplicate placeholder ids: {sorted(dupes)}")
+        layer_ids = [ly.id for ly in self.layers]
+        dupes = {i for i in layer_ids if layer_ids.count(i) > 1}
+        if dupes:
+            raise ValueError(f"Duplicate layer ids: {sorted(dupes)}")
+        placeholder_ids = set(ids)
+        for ly in self.layers:
+            if ly.kind == "text" and ly.id not in placeholder_ids:
+                raise ValueError(f"Text layer '{ly.id}' has no matching placeholder")
+            if ly.kind != "text" and ly.id in placeholder_ids:
+                raise ValueError(f"Layer id '{ly.id}' is already used by a placeholder")
+        group_ids = {g.id for g in self.groups}
+        if len(group_ids) != len(self.groups):
+            raise ValueError("Duplicate group ids")
+        for ly in self.layers:
+            if ly.group_id is not None and ly.group_id not in group_ids:
+                raise ValueError(f"Layer '{ly.id}' references unknown group '{ly.group_id}'")
         return self
+
+    def stack(self) -> list[Layer | Placeholder]:
+        """Everything to draw, bottom to top: the layers, then placeholders that have no text layer."""
+        by_id = {p.id: p for p in self.placeholders}
+        out: list[Layer | Placeholder] = []
+        seen: set[str] = set()
+        for ly in self.layers:
+            if ly.kind == "text":
+                out.append(by_id[ly.id])
+                seen.add(ly.id)
+            else:
+                out.append(ly)
+        out += [p for p in self.placeholders if p.id not in seen]
+        return out

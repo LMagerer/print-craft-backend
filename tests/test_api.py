@@ -251,3 +251,88 @@ def test_cancel_queued_job(client):
     r = client.post(f"{API}/jobs/{jid}/cancel")
     assert r.status_code == 200
     assert client.get(f"{API}/jobs").status_code == 200
+
+
+def _pdf_bytes(w_pt=242.65, h_pt=153.07):
+    from reportlab.pdfgen import canvas as rl_canvas
+
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=(w_pt, h_pt))
+    c.setFillColorRGB(1, 0, 0)
+    c.rect(0, 0, w_pt, h_pt, fill=1, stroke=0)
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def test_pdf_upload_becomes_image(client):
+    r = client.post(f"{API}/images", files={"file": ("card.pdf", _pdf_bytes(), "application/pdf")})
+    assert r.status_code == 201, r.text
+    info = r.json()
+    # 85.6 x 54 mm at 300 DPI
+    assert (info["width_px"], info["height_px"]) == (1011, 638) and info["dpi"] == pytest.approx(300, abs=0.01)
+    assert client.post(f"{API}/images", files={"file": ("x.pdf", b"%PDF-1.4 broken", "application/pdf")}).status_code == 422
+
+
+def test_blank_template_layers_export_import(client):
+    r = client.post(f"{API}/templates/blank", json={"name": "Blank", "width_mm": 85.6, "height_mm": 54, "dpi": 300, "background": "#112233"})
+    assert r.status_code == 201, r.text
+    t = r.json()
+    assert (t["width_px"], t["height_px"]) == (1011, 638) and t["config"]["background"] == "#112233"
+
+    img = _upload_image(client, 200, 100)
+    cfg = t["config"]
+    cfg["groups"] = [{"id": "g", "name": "Logo"}]
+    cfg["layers"] = [
+        {"id": "logo", "kind": "image", "group_id": "g", "x_mm": 5, "y_mm": 5, "width_mm": 20, "height_mm": 10, "image": {"ref": img["ref"]}},
+        {"id": "bar", "kind": "shape", "group_id": "g", "x_mm": 0, "y_mm": 40, "width_mm": 85.6, "height_mm": 5, "shape": {"fill": "#ff0000"}},
+    ]
+    u = client.put(f"{API}/templates/{t['id']}", json={"config": cfg})
+    assert u.status_code == 200, u.text
+    thumb = client.get(f"{API}/templates/{t['id']}/thumbnail", params={"size": 200})
+    assert thumb.status_code == 200 and Image.open(io.BytesIO(thumb.content)).width == 200
+
+    bad = dict(cfg, layers=[{"id": "x", "kind": "text"}])
+    assert client.put(f"{API}/templates/{t['id']}", json={"config": bad}).status_code == 422
+
+    exported = client.get(f"{API}/templates/{t['id']}/export").content
+    assert any(n.startswith("images/") for n in zipfile.ZipFile(io.BytesIO(exported)).namelist())
+    imp = client.post(f"{API}/templates/import", files={"file": ("t.zip", exported, "application/zip")}).json()
+    assert imp["config"]["layers"] == u.json()["config"]["layers"]
+
+
+def test_template_from_image_is_layer(client):
+    img = _upload_image(client, 600, 300)
+    t = client.post(f"{API}/templates/blank", json={"name": "From image", "image_ref": img["ref"], "background": None}).json()
+    assert (t["width_px"], t["height_px"]) == (600, 300)
+    [layer] = t["config"]["layers"]
+    assert layer["kind"] == "image" and layer["image"]["ref"] == img["ref"] and layer["image"]["fit"] == "fill"
+    assert layer["width_mm"] == pytest.approx(50.8, abs=0.01)
+    # Rendering reproduces the source pixels exactly.
+    r = client.post(f"{API}/render/preview", json={"config": t["config"], "image_ref": t["image_sha256"]})
+    assert Image.open(io.BytesIO(r.content)).convert("RGB").getpixel((300, 150)) == (30, 60, 200)
+
+
+def test_photo_library_and_job_warning(client):
+    photo = make_png(50, 50, (0, 200, 0))
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("people/bob.png", make_png(50, 50, (200, 0, 0)))
+    r = client.post(f"{API}/photos", files=[("files", ("Ada.png", photo, "image/png")), ("files", ("p.zip", buf.getvalue(), "application/zip"))])
+    assert r.status_code == 201, r.text
+    assert {p["name"] for p in client.get(f"{API}/photos").json()} >= {"Ada.png", "bob.png"}
+
+    t = client.post(f"{API}/templates/blank", json={"name": "Photo card", "width_mm": 50, "height_mm": 50, "dpi": 254}).json()
+    cfg = t["config"]
+    cfg["layers"] = [{"id": "ph", "kind": "image", "x_mm": 0, "y_mm": 0, "width_mm": 50, "height_mm": 50, "image": {"mode": "field", "field": "photo"}}]
+    r = client.post(f"{API}/render/preview", json={"config": cfg, "image_ref": t["image_sha256"], "record": {"photo": "BOB"}})
+    assert Image.open(io.BytesIO(r.content)).convert("RGB").getpixel((250, 250)) == (200, 0, 0)
+    assert json.loads(unquote(r.headers["X-Render-Warnings"])) == []
+
+    client.put(f"{API}/templates/{t['id']}", json={"config": cfg})
+    ds = _dataset(client, [{"photo": "ada.png"}, {"photo": "zed"}])
+    job = client.post(f"{API}/jobs", json={"template_id": t["id"], "dataset_id": ds["id"]}).json()
+    j = _wait(client, job["id"])
+    assert j["status"] == "completed"
+    assert [e["row"] for e in j["errors"] if e.get("warning")] == [1]
+    assert client.delete(f"{API}/photos/bob.png").status_code == 204

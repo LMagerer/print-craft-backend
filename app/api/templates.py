@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 from typing import Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
+from PIL import Image
 from sqlalchemy.orm import Session
+
+from app.core.config import get_settings
 
 from app.api.deps import read_upload
 from app.db.models import Template
 from app.db.repository import TemplateRepository
 from app.db.session import get_db
-from app.schemas.api import DuplicateRequest, TemplateCreate, TemplateOut, TemplateSummary, TemplateUpdate, TemplateVersionOut
+from app.schemas.api import BlankTemplateCreate, DuplicateRequest, TemplateCreate, TemplateOut, TemplateSummary, TemplateUpdate, TemplateVersionOut
 from app.schemas.config import TemplateConfig
+from app.services import image_tools
 from app.services import template_service as svc
+from app.services.card_renderer import CardRenderer
+from app.services.font_manager import FontLibrary
 from app.services.tokens import sanitize_filename
 
 router = APIRouter(prefix="/templates", tags=["templates"])
@@ -63,6 +72,12 @@ def create_template(body: TemplateCreate, db: Session = Depends(get_db)) -> Temp
     return _out(_run(svc.create_template, db, body))
 
 
+@router.post("/blank", response_model=TemplateOut, status_code=201)
+def create_blank_template(body: BlankTemplateCreate, db: Session = Depends(get_db)) -> TemplateOut:
+    """Start a design from an empty canvas, or from an uploaded image/PDF that becomes an editable layer."""
+    return _out(_run(svc.create_blank, db, body))
+
+
 @router.post("/import", response_model=TemplateOut, status_code=201)
 async def import_template(file: UploadFile = File(...), name: str | None = Form(None), db: Session = Depends(get_db)) -> TemplateOut:
     return _out(_run(svc.import_zip, db, await read_upload(file), name))
@@ -102,6 +117,23 @@ def restore_version(template_id: int, version: int, db: Session = Depends(get_db
 @router.get("/{template_id}/image")
 def template_image(template_id: int, db: Session = Depends(get_db)) -> FileResponse:
     return FileResponse(_get(db, template_id).image_path)
+
+
+@router.get("/{template_id}/thumbnail", response_class=Response, responses={200: {"content": {"image/png": {}}}})
+def template_thumbnail(template_id: int, size: int = 480, db: Session = Depends(get_db)) -> Response:
+    """The whole design (all layers, sample text) as a small PNG; cached per image/config/size."""
+    t = _get(db, template_id)
+    size = max(32, min(1024, size))
+    key = hashlib.sha256(json.dumps([t.image_sha256, t.config_json, size], sort_keys=True).encode()).hexdigest()
+    cache = get_settings().cache_dir / f"tpl_{key}.png"
+    if not cache.exists():
+        card = CardRenderer(image_tools.open_image(t.image_path), TemplateConfig.model_validate(t.config_json), FontLibrary.from_db(db)).render(None)
+        img = card.image
+        img.thumbnail((size, size), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        cache.write_bytes(buf.getvalue())
+    return FileResponse(cache, media_type="image/png", headers={"Cache-Control": "no-cache"})
 
 
 @router.get("/{template_id}/export")

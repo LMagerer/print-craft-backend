@@ -17,6 +17,7 @@ from app.schemas.api import GlyphCheckItem, GlyphCheckRequest, GlyphCheckRespons
 from app.services import image_tools
 from app.services.card_renderer import CardRenderer, glyph_check
 from app.services.font_manager import FontLibrary
+from app.services.photo_library import PhotoResolver
 
 router = APIRouter(prefix="/render", tags=["render"])
 
@@ -25,7 +26,8 @@ router = APIRouter(prefix="/render", tags=["render"])
 def preview(req: PreviewRequest, db: Session = Depends(get_db)) -> Response:
     """Render one card at full resolution with the production renderer and return it as PNG.
 
-    The ``X-Render-Report`` header carries per-placeholder info (final font size, overflow, missing glyphs).
+    The ``X-Render-Report`` header carries per-placeholder info (final font size, overflow, missing glyphs);
+    ``X-Render-Warnings`` lists other problems such as photos that were not found.
     """
     record = req.record
     if record is None and req.dataset_id:
@@ -35,7 +37,7 @@ def preview(req: PreviewRequest, db: Session = Depends(get_db)) -> Response:
             raise HTTPException(422, f"Record {idx} out of range ({len(records)} rows)")
         record = records[idx]
     base = image_tools.open_image(image_path(req.image_ref))
-    card = CardRenderer(base, req.config, FontLibrary.from_db(db)).render(record)
+    card = CardRenderer(base, req.config, FontLibrary.from_db(db), PhotoResolver()).render(record)
     img = card.image
     if req.max_width and img.width > req.max_width:
         img = img.copy()
@@ -49,7 +51,11 @@ def preview(req: PreviewRequest, db: Session = Depends(get_db)) -> Response:
     return Response(
         data,
         media_type="image/png",
-        headers={"X-Render-Report": quote(json.dumps(report, ensure_ascii=False)), "Cache-Control": "no-store"},
+        headers={
+            "X-Render-Report": quote(json.dumps(report, ensure_ascii=False)),
+            "X-Render-Warnings": quote(json.dumps(card.warnings, ensure_ascii=False)),
+            "Cache-Control": "no-store",
+        },
     )
 
 

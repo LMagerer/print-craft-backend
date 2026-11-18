@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api import datasets, fonts, images, jobs, render, templates
+from app.api import datasets, fonts, images, jobs, photos, render, templates
 from app.core.config import BACKEND_DIR, get_settings
 from app.db.session import SessionLocal
 from app.services.data_loader import get_store
@@ -61,11 +61,11 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
-        expose_headers=["X-Render-Report", "Content-Disposition"],
+        expose_headers=["X-Render-Report", "X-Render-Warnings", "Content-Disposition"],
     )
 
     api = APIRouter(prefix=API_PREFIX)
-    for module in (templates, datasets, images, fonts, render, jobs):
+    for module in (templates, datasets, images, photos, fonts, render, jobs):
         api.include_router(module.router)
 
     @api.get("/health", tags=["meta"])

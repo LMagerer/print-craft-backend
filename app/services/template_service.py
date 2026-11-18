@@ -17,8 +17,8 @@ from app.core.config import get_settings
 from app.core.units import MM_PER_INCH, dpi_for
 from app.db.models import Font, Template
 from app.db.repository import TemplateRepository, transaction
-from app.schemas.api import TemplateCreate, TemplateUpdate
-from app.schemas.config import SizeConfig, TemplateConfig
+from app.schemas.api import BlankTemplateCreate, TemplateCreate, TemplateUpdate
+from app.schemas.config import ImageSource, Layer, SizeConfig, TemplateConfig
 from app.services import font_manager, image_tools
 from app.services.data_loader import get_store
 from app.services.storage import find_by_sha, store_bytes
@@ -81,6 +81,42 @@ def create_template(db: Session, body: TemplateCreate) -> Template:
         config = body.config or TemplateConfig(size=default_size(img))
         t = Template(name=body.name, description=body.description, original_image_sha256=body.image_ref)
         _apply_image(t, body.image_ref, config)
+        repo.add(t)
+    return t
+
+
+def _blank_png(width_px: int, height_px: int, dpi: float) -> str:
+    img = Image.new("RGBA", (width_px, height_px), (0, 0, 0, 0))
+    sha, _ = store_bytes(get_settings().templates_dir, image_tools.png_bytes(img, round(dpi, 3), None), "png")
+    return sha
+
+
+def create_blank(db: Session, body: BlankTemplateCreate) -> Template:
+    """New design on a transparent canvas. With ``image_ref`` the canvas takes the image's size and the image
+    becomes an ordinary (movable, removable) layer filling it."""
+    repo = TemplateRepository(db)
+    with transaction(db):
+        if repo.get_by_name(body.name):
+            raise Conflict(f"A template named '{body.name}' already exists")
+        layers: list[Layer] = []
+        if body.image_ref:
+            _, img = _image(body.image_ref)
+            size = default_size(img)
+            width_px, height_px = img.width, img.height
+            layers.append(
+                Layer(
+                    id="background-image", kind="image", name=body.image_name or "Background image",
+                    width_mm=size.width_mm, height_mm=size.height_mm, image=ImageSource(ref=body.image_ref, fit="fill"),
+                )
+            )
+        else:
+            size = SizeConfig(width_mm=body.width_mm, height_mm=body.height_mm, dpi=body.dpi)
+            width_px = max(1, round(body.width_mm / MM_PER_INCH * body.dpi))
+            height_px = max(1, round(body.height_mm / MM_PER_INCH * body.dpi))
+        ref = _blank_png(width_px, height_px, size.dpi)
+        config = TemplateConfig(size=size, background=body.background, layers=layers)
+        t = Template(name=body.name, description=body.description, original_image_sha256=ref)
+        _apply_image(t, ref, config)
         repo.add(t)
     return t
 
@@ -162,6 +198,18 @@ def _font_ids(config: TemplateConfig) -> set[int]:
     return ids
 
 
+def _layer_images(config: TemplateConfig) -> dict[str, Path]:
+    """Stored files of every image referenced by layers (static images and data-bound samples)."""
+    out: dict[str, Path] = {}
+    for ly in config.layers:
+        ref = ly.image.ref if ly.image else None
+        if ref and ref not in out:
+            path = find_by_sha(get_settings().templates_dir, ref)
+            if path is not None:
+                out[ref] = path
+    return out
+
+
 def export_zip(db: Session, t: Template) -> bytes:
     """ZIP with ``config.json``, the image (original bytes) and every referenced font file."""
     config = TemplateConfig.model_validate(t.config_json)
@@ -182,6 +230,9 @@ def export_zip(db: Session, t: Template) -> bytes:
         "description": t.description,
         "image": f"image{image_path.suffix}",
         "config": config.model_dump(mode="json"),
+        "layer_images": [
+            {"ref": ref, "file": f"images/{path.name}"} for ref, path in _layer_images(config).items()
+        ],
         "fonts": [
             {"id": f.id, "file": f"fonts/{f.sha256}{Path(f.file_path).suffix}", "name": f.name, "family": f.family,
              "style": f.style, "filename": f.filename}
@@ -193,6 +244,8 @@ def export_zip(db: Session, t: Template) -> bytes:
         zf.writestr("config.json", json.dumps(manifest, indent=2, ensure_ascii=False), compress_type=zipfile.ZIP_DEFLATED)
         # Images and fonts are stored as-is (PNG is already compressed).
         zf.write(image_path, manifest["image"], compress_type=zipfile.ZIP_STORED)
+        for entry, path in zip(manifest["layer_images"], _layer_images(config).values()):
+            zf.write(path, entry["file"], compress_type=zipfile.ZIP_STORED)
         for entry, f in zip(manifest["fonts"], fonts.values()):
             zf.write(f.file_path, entry["file"], compress_type=zipfile.ZIP_DEFLATED)
     return buf.getvalue()
@@ -237,6 +290,16 @@ def import_zip(db: Session, data: bytes, name: str | None = None) -> Template:
                     raise Invalid(f"Font {entry.get('name')}: {e}") from e
                 id_map[int(entry["id"])] = font.id
             raw = manifest["config"]
+            ref_map: dict[str, str] = {}
+            for entry in manifest.get("layer_images", []):
+                try:
+                    ref_map[str(entry["ref"])] = image_tools.store_image(_read_entry(zf, str(entry["file"]))).ref
+                except ValueError as e:
+                    raise Invalid(f"Layer image {entry.get('file')}: {e}") from e
+            for ly in raw.get("layers", []):
+                src = ly.get("image") or {}
+                if src.get("ref") in ref_map:
+                    src["ref"] = ref_map[src["ref"]]
             for p in raw.get("placeholders", []):
                 f = p.get("font", {})
                 for key in ("font_id", "fallback_font_id"):

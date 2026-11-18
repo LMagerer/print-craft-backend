@@ -45,6 +45,24 @@ def get_thumbnail(ref: str, size: int = 320) -> Response:
     return FileResponse(cache, media_type="image/png", headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
+BROWSER_FORMATS = {"PNG", "JPEG", "WEBP", "GIF", "BMP"}
+
+
+@router.get("/{ref}/display")
+def get_display(ref: str) -> Response:
+    """The image in a form every browser can draw: the original file, or an sRGB PNG for TIFF/CMYK."""
+    path = image_path(ref)
+    with Image.open(path) as probe:
+        native = probe.format in BROWSER_FORMATS and probe.mode != "CMYK"
+    if native:
+        return FileResponse(path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+    cache = get_settings().cache_dir / f"{ref}_display.png"
+    if not cache.exists():
+        img = image_tools.to_working_mode(image_tools.open_image(path))
+        cache.write_bytes(image_tools.png_bytes(img, None, None))
+    return FileResponse(cache, media_type="image/png", headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
 @router.post("/transform", response_model=TransformResponse)
 def transform(req: TransformRequest) -> TransformResponse:
     """Apply size-editor operations to a copy of ``source_ref`` and store the result as a new lossless PNG."""

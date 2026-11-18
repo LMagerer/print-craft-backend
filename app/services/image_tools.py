@@ -15,7 +15,7 @@ from PIL import Image, ImageCms, ImageOps, UnidentifiedImageError
 
 from app.core.config import get_settings
 from app.core.units import MM_PER_INCH, dpi_for, pixels_for
-from app.schemas.config import Placeholder, SizeConfig, TemplateConfig
+from app.schemas.config import Layer, Placeholder, SizeConfig, TemplateConfig
 from app.schemas.image import ImageInfo, TransformRequest
 from app.services.storage import store_bytes
 
@@ -85,8 +85,48 @@ def image_info(img: Image.Image, ref: str) -> ImageInfo:
 FORMAT_EXT = {"PNG": "png", "JPEG": "jpg", "TIFF": "tif", "WEBP": "webp", "BMP": "bmp", "GIF": "gif"}
 
 
+PDF_DPI = 300.0
+# Keeps a huge PDF page (e.g. A0) from producing a gigantic raster.
+PDF_MAX_PIXELS = 80_000_000
+
+
+def is_pdf(data: bytes) -> bool:
+    return data[:1024].lstrip().startswith(b"%PDF-")
+
+
+def rasterize_pdf(data: bytes, dpi: float = PDF_DPI) -> bytes:
+    """Render the first page of a PDF to a lossless PNG (white background) with DPI metadata."""
+    import pypdfium2 as pdfium
+
+    try:
+        pdf = pdfium.PdfDocument(data)
+    except pdfium.PdfiumError as e:
+        raise ValueError(f"Not a readable PDF: {e}") from e
+    try:
+        if len(pdf) == 0:
+            raise ValueError("The PDF has no pages")
+        page = pdf[0]
+        w_pt, h_pt = page.get_size()
+        px = (w_pt / 72 * dpi) * (h_pt / 72 * dpi)
+        if px > PDF_MAX_PIXELS:
+            dpi *= (PDF_MAX_PIXELS / px) ** 0.5
+        img = page.render(scale=dpi / 72, fill_color=(255, 255, 255, 255), may_draw_forms=True).to_pil().convert("RGB")
+        # pdfium rounds the bitmap size up; keep the nearest whole-pixel size so the physical size stays exact.
+        tw, th = max(1, round(w_pt / 72 * dpi)), max(1, round(h_pt / 72 * dpi))
+        if img.width >= tw and img.height >= th and (img.width, img.height) != (tw, th):
+            img = img.crop((0, 0, tw, th))
+    finally:
+        pdf.close()
+    return png_bytes(img, round(dpi, 3), None)
+
+
 def store_image(data: bytes) -> ImageInfo:
-    """Store uploaded image bytes untouched (never recompressed), deduplicated by SHA-256."""
+    """Store uploaded image bytes untouched (never recompressed), deduplicated by SHA-256.
+
+    A PDF is rasterised first (page 1 at 300 DPI, as a lossless PNG).
+    """
+    if is_pdf(data):
+        data = rasterize_pdf(data)
     try:
         with Image.open(io.BytesIO(data)) as probe:
             probe.verify()
@@ -221,7 +261,19 @@ def map_placeholders(config: TemplateConfig, kx: float, ky: float, ox_mm: float 
         f.shadow.offset_y_mm = p.font.shadow.offset_y_mm * kf
         f.shadow.blur_mm = p.font.shadow.blur_mm * kf
         out.append(q)
-    return config.model_copy(update={"placeholders": out}, deep=True)
+    layers: list[Layer] = []
+    for ly in config.layers:
+        q = ly.model_copy(deep=True)
+        if ly.kind != "text":
+            q.x_mm = ly.x_mm * kx + ox_mm
+            q.y_mm = ly.y_mm * ky + oy_mm
+            q.width_mm = ly.width_mm * kx
+            q.height_mm = ly.height_mm * ky
+            q.corner_radius_mm = ly.corner_radius_mm * kf
+            if q.shape is not None:
+                q.shape.stroke_width_mm = ly.shape.stroke_width_mm * kf  # type: ignore[union-attr]
+        layers.append(q)
+    return config.model_copy(update={"placeholders": out, "layers": layers}, deep=True)
 
 
 def scale_placeholders_proportional(config: TemplateConfig, new_w_mm: float, new_h_mm: float) -> TemplateConfig:
